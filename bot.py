@@ -651,7 +651,7 @@ async def on_member_join(member):
             await chat_channel.send(emo(
                 f"嗷呜！新伙伴 {member.mention} 来啦~ "
                 f"去 {primary_channel.mention if primary_channel else '欢迎频道'} "
-                f"选个目的（写词 / 反推 / 查标签 / 视频码…），本哈给你指路！汪！",
+                f"选个目的（写词 / 反推 / 绘画写卡查提示词 / 酒馆 / 视频码…），本哈给你指路！汪！",
                 scenario="welcome",
             ))
         except Exception as e:
@@ -2222,6 +2222,12 @@ async def on_message(message):
             "• `在线查词 <关键词>` — 联网搜索标签\n"
             "• `d浏览` / `标签面板` — 打开标签分类浏览\n"
             "• `打开标签目录` — 查看知识库标签分类\n\n"
+            "🌐 **【绘画，写卡，查提示词】**\n"
+            "• [ComfyUI Web](https://comfyui-web-89u.pages.dev/) — 出图 · 写角色卡 · 查画师/提示词\n"
+            "• 或发 `指路` 点绿色主推按钮\n\n"
+            "🏠 **【本地装酒馆玩角色卡】**\n"
+            "• `指路` → 选「本地装酒馆玩角色卡」看安装教程\n"
+            "• 不想本地部署 → 云酒馆免费注册 https://ai.cao.baby/register\n\n"
             "🎬 **【视频码】**\n"
             "• `签到` — 每日签到获得 1 个视频码（私信发送）\n"
             "• `发布作品` + 图片 — 发布到展示频道，每日最多获 3 个视频码\n\n"
@@ -2428,19 +2434,57 @@ async def on_message(message):
         return
 
 # --- 启动机器人 ---
+_LOGIN_RETRY_MAX = int(os.getenv("DISCORD_LOGIN_RETRY_MAX", "5"))
+_LOGIN_RETRY_BASE_SEC = int(os.getenv("DISCORD_LOGIN_RETRY_BASE_SEC", "30"))
+
+
+def _is_discord_rate_limited(exc: BaseException) -> bool:
+    """Cloudflare 1015 / Discord 429 等登录限流。"""
+    if isinstance(exc, discord.errors.HTTPException) and exc.status == 429:
+        return True
+    text = str(exc).lower()
+    return "429" in text or "too many requests" in text or "1015" in text or "rate limit" in text
+
+
 def start_bot():
-    """启动 Discord 机器人"""
+    """启动 Discord 机器人（登录限流时自动退避重试）。"""
     DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
     if not DISCORD_TOKEN:
         raise ValueError("未找到 DISCORD_TOKEN，请检查 .env 文件")
 
-    try:
-        print("🚀 正在尝试启动机器人...")
-        client_discord.run(DISCORD_TOKEN)
-    except discord.errors.LoginFailure:
-        print("❌ Discord Token 无效，请检查 .env 文件中的 DISCORD_TOKEN 是否正确。")
-    except Exception as e:
-        print(f"❌ 启动机器人时发生严重错误: {e}")
+    if PROXY_URL:
+        print(f"🌐 已配置代理: {PROXY_URL}")
+    else:
+        print("⚠️ 未配置 HTTP_PROXY/HTTPS_PROXY；若服务器 IP 被 Discord 限流，请在面板 .env 里加代理")
+
+    print("🚀 正在尝试启动机器人...")
+    for attempt in range(1, _LOGIN_RETRY_MAX + 1):
+        try:
+            client_discord.run(DISCORD_TOKEN)
+            return
+        except discord.errors.LoginFailure:
+            print("❌ Discord Token 无效，请检查 .env 文件中的 DISCORD_TOKEN 是否正确。")
+            return
+        except Exception as e:
+            if _is_discord_rate_limited(e) and attempt < _LOGIN_RETRY_MAX:
+                wait = min(_LOGIN_RETRY_BASE_SEC * attempt, 300)
+                print(
+                    f"⚠️ Discord 登录被限流（429/Cloudflare 1015），"
+                    f"{wait}s 后重试 ({attempt}/{_LOGIN_RETRY_MAX})…"
+                )
+                time.sleep(wait)
+                continue
+            if _is_discord_rate_limited(e):
+                print(
+                    "❌ Discord 登录持续被限流。常见原因：\n"
+                    "  1) 机房 IP（共享出口）被 Cloudflare 临时封禁 — 等 10~60 分钟再开\n"
+                    "  2) 短时间反复重启 bot — 拉长重启间隔\n"
+                    "  3) 在面板 .env 配置 HTTP_PROXY / HTTPS_PROXY 换出口\n"
+                    f"  原始错误: {e}"
+                )
+            else:
+                print(f"❌ 启动机器人时发生严重错误: {e}")
+            return
 
 if __name__ == "__main__":
     start_bot()
