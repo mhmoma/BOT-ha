@@ -4,5 +4,3 @@ openai
 python-dotenv
 Pillow
 httpx
-fastapi
-uvicorn[standard]

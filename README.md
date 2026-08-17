@@ -18,11 +18,14 @@ python -m venv .venv
 # Windows: .venv\Scripts\activate
 source .venv/bin/activate
 pip install -r requirements.txt
+# 若用 app.py / Railway / Render 健康检查：pip install -r requirements-web.txt
 cp .env.example .env
 # 编辑 .env：填入 DISCORD_TOKEN、OPENAI_API_BASE、OPENAI_API_KEY、OPENAI_MODEL_NAME
 python main.py
 # 或：uvicorn app:app --host 0.0.0.0 --port 7860
 ```
+
+Wispbyte 等只跑 `main.py` 的面板：用默认 `requirements.txt`（不含 FastAPI/uvicorn，更省磁盘）。
 
 ### Docker
 
