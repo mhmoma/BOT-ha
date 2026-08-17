@@ -1,14 +1,17 @@
 import json
 import os
+import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional
 
 TAG_CN_CACHE_FILE = os.getenv("TAG_CN_CACHE_FILE", "tag_cn_cache.json")
 TAG_TRANSLATE_AI = os.getenv("TAG_TRANSLATE_AI", "true").lower() == "true"
 BOORU_TAG_CSV_PATH = os.getenv("BOORU_TAG_CSV_PATH", "danbooru_translation_ref.csv")
+# 默认用百分号编码 URL，避免 Windows/部分环境 ASCII 无法编码中文路径
 BOORU_TAG_CSV_URL = os.getenv(
     "BOORU_TAG_CSV_URL",
-    "https://raw.githubusercontent.com/xhoxye/BooruTagCart/refs/heads/main/assets/danbooru_翻译参考文档.csv",
+    "https://raw.githubusercontent.com/xhoxye/BooruTagCart/refs/heads/main/assets/"
+    "danbooru_%E7%BF%BB%E8%AF%91%E5%8F%82%E8%80%83%E6%96%87%E6%A1%A3.csv",
 )
 
 _cn_cache: Dict[str, str] = {}
@@ -33,18 +36,31 @@ def _store_booru_entry(en_tag: str, cn_text: str):
     _booru_cart_map.setdefault(en_tag.strip().lower(), primary)
 
 
+def _encode_url(url: str) -> str:
+    """把 URL 路径里的非 ASCII 段做百分号编码（已编码的保持不变）。"""
+    parts = urllib.parse.urlsplit(url)
+    path = urllib.parse.quote(parts.path, safe="/%")
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
+
+
 def _download_csv(url: str, dest: str) -> bool:
     try:
-        print(f"📥 正在下载 BooruTagCart 汉化参考表…")
-        req = urllib.request.Request(url, headers={"User-Agent": "xiaoha-bot/1.0"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        print("📥 正在下载 BooruTagCart 汉化参考表…", flush=True)
+        safe_url = _encode_url(url)
+        req = urllib.request.Request(safe_url, headers={"User-Agent": "xiaoha-bot/1.0"})
+        proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("https_proxy") or os.getenv("http_proxy")
+        handlers = []
+        if proxy:
+            handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        opener = urllib.request.build_opener(*handlers) if handlers else urllib.request.build_opener()
+        with opener.open(req, timeout=120) as resp:
             data = resp.read()
         with open(dest, "wb") as f:
             f.write(data)
-        print(f"✅ 已保存到 {dest}（{len(data) // 1024} KB）")
+        print(f"✅ 已保存到 {dest}（{len(data) // 1024} KB）", flush=True)
         return True
     except Exception as e:
-        print(f"⚠️ 下载汉化参考表失败: {e}")
+        print(f"⚠️ 下载汉化参考表失败: {e}", flush=True)
         return False
 
 
@@ -73,7 +89,7 @@ def load_booru_cart_csv(path: Optional[str] = None) -> int:
                 _store_booru_entry(en_tag, cn_text)
                 count += 1
     except Exception as e:
-        print(f"⚠️ 读取汉化参考表失败: {e}")
+        print(f"⚠️ 读取汉化参考表失败: {e}", flush=True)
         return 0
     return count
 
