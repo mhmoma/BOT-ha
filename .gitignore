@@ -9,6 +9,9 @@
 *.bak
 tag_cn_cache.json
 
+# 汉化参考表：首次运行由 tag_translate 自动下载，勿再入库
+danbooru_translation_ref.csv
+
 # 忽略Python的虚拟环境文件夹
 .venv/
 

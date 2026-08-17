@@ -48,12 +48,15 @@ docker run --env-file .env -p 7860:7860 discord-prompt-bot
 
 | 路径 | 说明 |
 |------|------|
+| `main.py` | 入口（Wispbyte 等直接跑 bot） |
 | `bot.py` | 机器人主逻辑 |
 | `danbooru_api.py` / `tag_*.py` | 标签与词库 |
-| `app.py` | FastAPI 健康检查入口 |
+| `app.py` | FastAPI 健康检查入口（Railway / Render / Docker） |
+| `classified_lexicon.json` | 运行时词库（体积较大） |
 | `chat_style_corpus.json` | 聊天人设语料 |
 
 ## 注意
 
 - 不要将真实 `.env`、Token、频道/用户 ID 提交到仓库
-- 大规模词库文件体积较大，克隆时请确保磁盘空间充足
+- `classified_lexicon.json` 体积较大，克隆/部署请预留磁盘
+- `danbooru_translation_ref.csv` 不入库；首次启动会由 `tag_translate` 自动下载到本地

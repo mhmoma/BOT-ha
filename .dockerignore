@@ -9,3 +9,5 @@ __pycache__
 .cursor
 *.bak
 classified_lexicon.json.bak
+danbooru_translation_ref.csv
+tag_cn_cache.json
