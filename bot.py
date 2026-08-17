@@ -76,6 +76,14 @@ compliment_recent = {}  # channel_id -> [最近用过的文案]
 _welcome_ch_id = os.getenv("WELCOME_CHANNEL_ID", "1442454462730993697").strip()
 WELCOME_CHANNEL_ID = int(_welcome_ch_id) if _welcome_ch_id.isdigit() else None
 
+# --- 反推专用频道 + 私聊引导（同一频道）---
+# https://discord.com/channels/1442454462043132037/1444264557211156500
+_reverse_ch_id = os.getenv("REVERSE_CHANNEL_ID", "1444264557211156500").strip()
+REVERSE_CHANNEL_ID = int(_reverse_ch_id) if _reverse_ch_id.isdigit() else None
+_dm_notify_cd = int(os.getenv("DM_REDIRECT_NOTIFY_COOLDOWN", "300"))
+DM_REDIRECT_NOTIFY_COOLDOWN = max(30, _dm_notify_cd)
+_dm_redirect_notified_at: dict[int, float] = {}  # user_id -> last notify timestamp
+
 # --- OpenAI 兼容 API 配置 ---
 API_BASE = os.getenv("OPENAI_API_BASE")
 API_KEY = os.getenv("OPENAI_API_KEY")
@@ -662,11 +670,13 @@ def print_startup_help():
     kb_status = "已加载" if KNOWLEDGE_BASE else "未加载"
     kb_cats = len(get_browse_categories()) if KNOWLEDGE_BASE else 0
     welcome_ch = f"ID {WELCOME_CHANNEL_ID}" if WELCOME_CHANNEL_ID else "名称匹配 / 系统频道"
+    reverse_ch = f"ID {REVERSE_CHANNEL_ID}" if REVERSE_CHANNEL_ID else "未限制"
 
     print(f"✅ 机器人已登录：{client_discord.user}")
     print(f"💡 使用模型：{MODEL_NAME}")
     print(f"📚 知识库：{kb_status}" + (f"（{kb_cats} 个分类）" if kb_cats else ""))
     print(f"👋 欢迎频道：{welcome_ch}")
+    print(f"🖼️ 反推频道：{reverse_ch}（私聊拦截并引导至此）")
     master_info = f"{MASTER_NAME}" + (f" (ID {MASTER_BOT_ID})" if MASTER_BOT_ID else "")
     print(f"🐾 唯一主人：{master_info}")
     danb_user = os.getenv("DANBOORU_API_USER", "").strip()
@@ -680,8 +690,9 @@ def print_startup_help():
     print("=" * 48)
 
     print("\n🎨 【绘画提示词】")
-    print("  反推              回复含图消息：构图点评 + 可能画师 + 英文 tag 提示词")
+    print("  反推              仅限反推频道：回复含图消息 → 构图点评 + 可能画师 + 英文 tag")
     print("  画 <想法>         根据文字描述构思详细绘画提示词")
+    print("  私聊              一律拦截，引导到反推频道并在该频道提醒")
     print(f"  @{bot_name} 生成…  同上，@ 后直接说「生成/画…」即可")
     print("  例：画 赛博朋克雨夜街头")
 
@@ -849,6 +860,70 @@ def should_send_compliment(message) -> bool:
 def author_in_chat_state(author_id: int) -> bool:
     state = user_states.get(author_id)
     return isinstance(state, dict) and state.get('state') == 'chatting'
+
+
+def _reverse_channel_mention() -> str:
+    if REVERSE_CHANNEL_ID:
+        return f"<#{REVERSE_CHANNEL_ID}>"
+    return "反推频道"
+
+
+def _is_reverse_channel(channel) -> bool:
+    if not REVERSE_CHANNEL_ID:
+        return True
+    return getattr(channel, "id", None) == REVERSE_CHANNEL_ID
+
+
+async def _handle_dm_redirect(message) -> None:
+    """私聊一律拦截：回复用户，并在反推频道提醒（带冷却）。"""
+    mention = _reverse_channel_mention()
+    try:
+        await message.reply(
+            emo(
+                f"本哈不接私聊嗷～请到服务器 {mention} 找我。\n"
+                f"反推只能在那个频道用：回复图片发 `反推`。汪！",
+                scenario="info",
+            )
+        )
+    except Exception as e:
+        print(f"⚠️ 私聊回复失败: {e}")
+
+    if not REVERSE_CHANNEL_ID:
+        return
+
+    uid = message.author.id
+    now = time.time()
+    last = _dm_redirect_notified_at.get(uid, 0)
+    if now - last < DM_REDIRECT_NOTIFY_COOLDOWN:
+        return
+    _dm_redirect_notified_at[uid] = now
+
+    channel = client_discord.get_channel(REVERSE_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await client_discord.fetch_channel(REVERSE_CHANNEL_ID)
+        except Exception as e:
+            print(f"⚠️ 无法获取反推频道 {REVERSE_CHANNEL_ID}: {e}")
+            return
+
+    preview = (message.content or "").strip().replace("\n", " ")
+    if len(preview) > 80:
+        preview = preview[:80] + "…"
+    has_img = "（含图）" if message.attachments else ""
+    detail = f"：{preview}" if preview else has_img
+    if preview and has_img:
+        detail = f"：{preview} {has_img}"
+
+    try:
+        await channel.send(
+            emo(
+                f"📬 {message.author.mention} 刚私聊了本哈{detail}\n"
+                f"已引导来本频道。要用 `反推` 就在这里回图发指令～",
+                scenario="info",
+            )
+        )
+    except Exception as e:
+        print(f"⚠️ 反推频道提醒失败: {e}")
 
 async def generate_lite_compliment(image_data: bytes) -> str:
     base64_image = image_to_base64(image_data)
@@ -2159,6 +2234,11 @@ async def on_message(message):
     content = message.content.strip()
     content_lower = content.lower()
 
+    # --- 私聊一律拦截：引导到反推频道，并在该频道提醒 ---
+    if message.guild is None:
+        await _handle_dm_redirect(message)
+        return
+
     # --- 0. 护主反击（说主人坏话 → 不等 @，优先触发）---
     if _is_insulting_master(content) and not _already_defended_insult(message.id):
         try:
@@ -2180,6 +2260,15 @@ async def on_message(message):
         return
 
     if content_lower == "反推":
+        if not _is_reverse_channel(message.channel):
+            await message.reply(
+                emo(
+                    f"反推只能在 {_reverse_channel_mention()} 用嗷～"
+                    f"请到那边回复图片再发 `反推`。汪！",
+                    scenario="info",
+                )
+            )
+            return
         if author_id in user_states:
             del user_states[author_id]
         target_message = message
@@ -2216,8 +2305,9 @@ async def on_message(message):
             f"🐾 嗨～ 我是小哈！{MASTER_NAME} 家的哈士奇，会画画的群友狗 🎨\n\n"
             "这是我能做的事：\n\n"
             "🖼️ **【绘画提示词】**\n"
-            "• `反推` — 回复一张图 + 发「反推」，深度分析生成英文 tag\n"
-            "• `画 <想法>` — 根据描述构思详细绘画提示词\n\n"
+            f"• `反推` — 仅限 {_reverse_channel_mention()}：回复一张图 + 发「反推」\n"
+            "• `画 <想法>` — 根据描述构思详细绘画提示词\n"
+            f"• 私聊本哈会引导到 {_reverse_channel_mention()}，不接私聊对话\n\n"
             "📖 **【标签词典】**\n"
             "• `查词 <关键词>` — 搜索 Danbooru 标签\n"
             "• `在线查词 <关键词>` — 联网搜索标签\n"
