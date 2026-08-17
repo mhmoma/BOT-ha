@@ -763,8 +763,86 @@ def emo(text: str, *, scenario: str | None = None, emotion: str | None = None, t
     """按场景/语气在回复前插入应用表情。"""
     return app_emojis.decorate(text, scenario=scenario, emotion=emotion, tone=tone)
 
+# 视觉 API 体积上限（413 Payload Too Large 多半超了网关限制）
+_IMAGE_API_MAX_SIDE = int(os.getenv("IMAGE_API_MAX_SIDE", "1536"))
+_IMAGE_API_MAX_BYTES = int(os.getenv("IMAGE_API_MAX_BYTES", "1200000"))  # JPEG 目标体积
+
+
 def image_to_base64(image_data: bytes) -> str:
-    return base64.b64encode(image_data).decode('utf-8')
+    return base64.b64encode(image_data).decode("utf-8")
+
+
+def prepare_image_data_url(image_data: bytes) -> str:
+    """缩放 + JPEG 压缩后再转 data URL，避免反推/评论撞 413。"""
+    max_side = max(512, _IMAGE_API_MAX_SIDE)
+    max_bytes = max(200_000, _IMAGE_API_MAX_BYTES)
+    try:
+        img = Image.open(io.BytesIO(image_data))
+        img.load()
+    except Exception as e:
+        print(f"⚠️ 图片解码失败，回退原图 base64: {e}")
+        return f"data:image/jpeg;base64,{image_to_base64(image_data)}"
+
+    if getattr(img, "n_frames", 1) > 1:
+        try:
+            img.seek(0)
+        except Exception:
+            pass
+
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[-1])
+        img = bg
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+
+    w, h = img.size
+    longest = max(w, h)
+    if longest > max_side:
+        scale = max_side / float(longest)
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+
+    quality = 85
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=quality, optimize=True)
+    data = out.getvalue()
+    while len(data) > max_bytes and quality > 40:
+        quality -= 10
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=quality, optimize=True)
+        data = out.getvalue()
+
+    # 仍过大则继续缩小边长
+    while len(data) > max_bytes and max(img.size) > 640:
+        nw = max(1, int(img.size[0] * 0.75))
+        nh = max(1, int(img.size[1] * 0.75))
+        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=max(40, quality), optimize=True)
+        data = out.getvalue()
+
+    print(f"📎 视觉图已压缩: {len(image_data)} → {len(data)} bytes, size={img.size}, q={quality}")
+    return f"data:image/jpeg;base64,{image_to_base64(data)}"
+
+
+def _friendly_vision_error(exc: Exception) -> str:
+    """把 API 原始错误翻成玩家能懂的话。"""
+    text = str(exc) or ""
+    low = text.lower()
+    if "413" in text or "payload too large" in low or "request entity too large" in low:
+        return "图片太大，本哈传不过去了。请换小一点的图，或压缩后再发 `反推` / @本哈点评。汪！"
+    if "429" in text or "rate limit" in low:
+        return "本哈这边排队太长了，稍后再试一下嗷。"
+    if "401" in text or "403" in text or "unauthorized" in low:
+        return "本哈连不上画画脑子了，请稍后再试或联系管理员。"
+    if "timeout" in low or "timed out" in low:
+        return "看图超时了，请再试一次。"
+    # 过长原始错误截断
+    short = text.strip().replace("\n", " ")
+    if len(short) > 180:
+        short = short[:180] + "…"
+    return f"分析失败：{short}" if short else "分析失败，请稍后重试。"
 
 
 def _parse_llm_json(raw_content: str) -> dict:
@@ -926,8 +1004,7 @@ async def _handle_dm_redirect(message) -> None:
         print(f"⚠️ 反推频道提醒失败: {e}")
 
 async def generate_lite_compliment(image_data: bytes) -> str:
-    base64_image = image_to_base64(image_data)
-    image_url = f"data:image/jpeg;base64,{base64_image}"
+    image_url = prepare_image_data_url(image_data)
     system_prompt = (
         _persona_base_block(compact=True)
         + "请根据图片写一句中文彩虹屁（35-50字）。"
@@ -973,13 +1050,12 @@ async def comment_on_image_when_awakened(image_data: bytes, author_mention: str,
     try:
         async with channel.typing():
             loading_message = await channel.send(emo("嗷呜！本哈正在用艺术的眼光审视这张图...", scenario="loading"))
-            base64_image = image_to_base64(image_data)
-            image_url = f"data:image/jpeg;base64,{base64_image}"
+            image_url = prepare_image_data_url(image_data)
             is_nsfw = False
             try:
                 nsfw_check_prompt = "这张图片是否包含裸露、性暗示或成人内容？请只回答'是'或'否'。"
                 nsfw_response = await client_openai.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": [{"type": "text", "text": nsfw_check_prompt}, {"type": "image_url", "image_url": {"url": image_url}}]}])
-                if '是' in nsfw_response.choices[0].message.content: is_nsfw = True
+                if '是' in (nsfw_response.choices[0].message.content or ""): is_nsfw = True
             except Exception as e: print(f"⚠️ 评论功能 NSFW 预检失败: {e}")
 
             if is_nsfw:
@@ -1071,8 +1147,8 @@ async def comment_on_image_when_awakened(image_data: bytes, author_mention: str,
             )
             await channel.send(content=final_message)
     except Exception as e:
-        error_message = emo(f"❌ 嗷呜~本哈的评论功能短路了：{str(e)}", scenario="error")
-        print(error_message)
+        error_message = emo(f"❌ 嗷呜~本哈的评论功能短路了：{_friendly_vision_error(e)}", scenario="error")
+        print(f"❌ 评论失败: {e}")
         try:
             if loading_message: await loading_message.edit(content=error_message)
             else: await channel.send(error_message)
@@ -1081,13 +1157,12 @@ async def comment_on_image_when_awakened(image_data: bytes, author_mention: str,
 async def analyze_image_with_openai(image_data: bytes, author_mention: str, channel):
     try:
         async with channel.typing():
-            base64_image = image_to_base64(image_data)
-            image_url = f"data:image/jpeg;base64,{base64_image}"
+            image_url = prepare_image_data_url(image_data)
             is_nsfw = False
             try:
                 nsfw_check_prompt = "这张图片是否包含裸露、性暗示或成人内容？请只回答'是'或'否'。"
                 nsfw_response = await client_openai.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": [{"type": "text", "text": nsfw_check_prompt}, {"type": "image_url", "image_url": {"url": image_url}}]}])
-                if '是' in nsfw_response.choices[0].message.content: is_nsfw = True
+                if '是' in (nsfw_response.choices[0].message.content or ""): is_nsfw = True
             except Exception as e: print(f"⚠️ NSFW 预检失败: {e}")
 
             guide_file = 'Deepseek绘图提示词引导.txt'
@@ -1152,16 +1227,22 @@ async def analyze_image_with_openai(image_data: bytes, author_mention: str, chan
                     author_mention, composition, artists, final_prompt
                 )
             except json.JSONDecodeError:
-                print(f"⚠️ 反推 JSON 解析失败，原始响应: {raw_content}")
-                final_message = (
-                    f"{author_mention} ❌ 反推报告解析失败，请重试。\n"
-                    f"```\n{(raw_content or '')[:500]}\n```"
-                )
+                print(f"⚠️ 反推 JSON 解析失败，原始响应: {raw_content!r}")
+                if not (raw_content or "").strip():
+                    final_message = (
+                        f"{author_mention} ❌ 本哈看图看傻了，模型没吐出报告。"
+                        f"请换张图或稍后再试 `反推`。汪！"
+                    )
+                else:
+                    final_message = (
+                        f"{author_mention} ❌ 反推报告解析失败，请重试。\n"
+                        f"```\n{(raw_content or '')[:500]}\n```"
+                    )
 
             await channel.send(emo(final_message, scenario="reverse", tone="art"))
     except Exception as e:
-        error_message = emo(f"❌ 分析失败：{str(e)}", scenario="error")
-        print(error_message)
+        error_message = emo(f"❌ {author_mention} {_friendly_vision_error(e)}", scenario="error")
+        print(f"❌ 反推失败: {e}")
         await channel.send(error_message)
 
 async def generate_art_prompt(user_idea: str, author_mention: str, channel):
